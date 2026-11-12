@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>精简版记忆架构：判断权分配 + 五层记忆 + 三线管道</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbf9;
+    --fg: #1b1b19;
+    --muted: #6b6b64;
+    --surface: #f3f2ec;
+    --surface-alt: #e9e8e0;
+    --border: #dcdad0;
+    --accent: #7a5c1e;
+    --danger: #a3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a;
+      --fg: #e6e6e2;
+      --muted: #9a9a94;
+      --surface: #1e1e23;
+      --surface-alt: #26262c;
+      --border: #34343c;
+      --accent: #d3b171;
+      --danger: #e8776f;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.7 -apple-system, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Roboto, sans-serif;
+  }
+  main { max-width: 940px; margin: 0 auto; padding: 56px 24px 96px; }
+  h1 { font-size: 1.7rem; line-height: 1.35; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 1.15rem; margin: 3.2rem 0 0.9rem; padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1rem; color: var(--muted); margin: 1.8rem 0 0.6rem; }
+  p, li { color: var(--fg); }
+  ul { padding-left: 1.4em; }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 0.88em;
+    background: var(--surface-alt);
+    padding: 0.1em 0.35em;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; margin: 1rem 0;
+  }
+  pre code { background: none; padding: 0; font-size: 0.85rem; line-height: 1.55; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.94rem; }
+  th, td { text-align: left; padding: 7px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface); font-weight: 600; }
+  tbody tr:nth-child(even) td { background: var(--surface); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
+  .bad { color: var(--danger); font-weight: 600; }
+
+  /* Pele 主题变量：图内配色跟随页面深浅色 */
+  .pele, pre.mermaid {
+    --pele-bg: var(--bg);
+    --pele-fg: var(--fg);
+    --pele-muted: var(--muted);
+    --pele-line: var(--muted);
+    --pele-surface: var(--surface);
+    --pele-surface-alt: var(--surface-alt);
+    --pele-border: var(--border);
+    --pele-error: var(--danger);
+    font-family: -apple-system, "Segoe UI", "Noto Sans SC", "Microsoft YaHei", Roboto, sans-serif;
+  }
+  /* 图卡可以突破正文栏宽；宽度大于容器时用 margin 居中（auto 会退化成 0） */
+  pre.mermaid {
+    box-sizing: border-box;
+    width: min(calc(100vw - 32px), 1500px);
+    margin: 1.2rem 0 1.2rem calc(50% - min(calc(100vw - 32px), 1500px) / 2);
+    padding: 20px 16px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    text-align: center;
+  }
+  pre.mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<main>
+<h1>精简版记忆架构：判断权分配 + 五层记忆 + 三线管道</h1>
+<p>本版重写的核心不是"多加几个模型"，而是<b>把每个判断交给唯一最合适的执行者，并且禁止任何执行者用"省钱"的理由做价值判断</b>。上一版的设计缺陷都来自同一个根源：用长度、字数这类廉价启发式冒充语义判断，于是"省一次模型调用"变成了"静默丢一条记忆"。</p>
+
+<h2>〇、架构总览</h2>
+<pre class="mermaid">flowchart TD
+    USER[&quot;用户&quot;] --&gt;|&quot;每轮输入（含查询）&quot;| WM[&quot;工作记忆&lt;br/&gt;最近 RecentLimit 轮原文&quot;]
+    WM --&gt;|&quot;本轮原文&quot;| ENCQ[&quot;编码队列（异步）&quot;]
+    ENCQ --&gt; EN[&quot;编码线&quot;]
+    WM --&gt;|&quot;逐轮文本&quot;| RT[&quot;召回线&quot;]
+    RT --&gt;|&quot;top-N 注入（不写回工作记忆）&quot;| REPLY[&quot;本轮回复上下文&quot;]
+    REPLY --&gt; USER
+
+    subgraph MODELS[&quot;三类执行者，各管一摊，互不越权&quot;]
+        direction TB
+        S2[&quot;system2 · qwen3.5:0.8b&lt;br/&gt;语义抽取 / 冲突仲裁 / 身份提炼&quot;]
+        EMB[&quot;embedding · qwen3-embedding:0.6b (1024)&lt;br/&gt;相似度 / 聚类 / 召回&quot;]
+        RULE[&quot;规则与数学&lt;br/&gt;重要性 / 衰减 / 排序 / 合并链&quot;]
+    end
+
+    EN -.-&gt; S2
+    EN -.-&gt; EMB
+    EN -.-&gt; RULE
+    RT -.-&gt; EMB
+    RT -.-&gt; RULE
+
+    subgraph STORE[&quot;长期记忆库（SQLite 单文件）&quot;]
+        direction TB
+        EP[&quot;episodic 事件级&quot;]
+        SE[&quot;semantic 事实/偏好&quot;]
+        PR[&quot;procedural 流程/能力&quot;]
+        ID[&quot;identity 自我模型&quot;]
+    end
+    EN --&gt;|&quot;写入 / supersede&quot;| STORE
+    STORE --&gt;|&quot;候选&quot;| RT
+    RT --&gt;|&quot;被动复习&quot;| STORE
+    RF[&quot;反思线（定时，可用 LLM）&quot;] --&gt;|&quot;归档 / 合簇 / 升级&quot;| STORE
+</pre>
+<p>三条线的入口都只有工作记忆。用户的一句查询首先是对话的一轮，然后才触发召回；召回结果只注入本轮回复上下文，<b>不写回工作记忆</b>——否则会被当成对话内容再编码一遍。</p>
+
+<h2>一、判断权分配（本版核心）</h2>
+<p>表里每一行是一个必须回答的问题。<b>没有"兜底规则"这一列</b>，因为兜底只能是把问题交给下一层更强的判断者，或者标记为未知并保留原始事实，不允许猜。</p>
+<table>
+<thead>
+<tr><th>判断</th><th>执行者</th><th>参数</th><th>执行者不可用时</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>本轮有没有值得记的信息？属于哪层？摘要是什么？</td>
+<td><b>system2</b>：qwen3.5:0.8b，JSON Schema 强约束，逐轮调用</td>
+<td>temperature=0、think=false、num_predict=256、prompt 带一个 few-shot 示例</td>
+<td><b>这一轮不写入记忆</b>（像发烧时记不住事），并把错误交回调用方，由宿主决定是否提示用户</td>
+</tr>
+<tr>
+<td>新记忆与已有记忆的关系：补充 / 更新 / 矛盾 / 无关</td>
+<td>两段式：<b>embedding 粗筛</b>（余弦过阈值，取 top3；<b>不按层级过滤</b>）→ 命中才让 <b>system2</b> 判关系</td>
+<td>粗筛只负责"值得问一下"，语义裁决只在命中时花一次调用</td>
+<td>粗筛不可用 → 不做合并，两条都留（宁可重复，不可覆盖）</td>
+</tr>
+<tr>
+<td>两条文本有多相似？（召回、聚类）</td>
+<td><b>embedding</b>：qwen3-embedding:0.6b，1024 维，L2 归一化后取余弦</td>
+<td>阈值必须按模型标定，见第九节</td>
+<td>退化为标签精确匹配 + 强度排序，<b>不假装有相似度</b></td>
+</tr>
+<tr>
+<td>这条记忆有多重要？</td>
+<td><b>规则</b>：显式记忆请求、层级、实体数、是否重复（只加分）</td>
+<td>见第六节；<b>只决定排序与复习节奏，不决定存不存</b></td>
+<td>—</td>
+</tr>
+<tr>
+<td>什么时候忘？强度怎么变？</td>
+<td><b>数学</b>：艾宾浩斯 8 档间隔 + 指数衰减；自变量是<b>经历轮次（tick）</b>，不读墙钟</td>
+<td>见第七、八节</td>
+<td>—</td>
+</tr>
+<tr>
+<td>现在编码，还是延后批量编码？（<b>只影响时机，不影响存不存</b>）</td>
+<td><b>system1</b>：qwen3:0.6b 二分类，约 150ms；仅在同步首字延迟被实测卡住时启用</td>
+<td>回答错也只会让编码早/晚几秒</td>
+<td>一律进异步队列</td>
+</tr>
+<tr>
+<td>身份层提炼（"这个人稳定是什么样"）</td>
+<td><b>system2</b>：反思时按簇调用，输入是簇内成员列表，输出一条规范表述</td>
+<td>需要 ≥ 3 条独立证据才触发</td>
+<td>保持原状，下次反思再试</td>
+</tr>
+<tr>
+<td>这条内容要不要丢弃？</td>
+<td><b>没有人有权丢弃</b></td>
+<td>遗忘只有一个出口：衰减到 archived，语义是<b>压缩</b>（细节变淡、排序打折、仍可召回），记录永久保留</td>
+<td>—</td>
+</tr>
+</tbody></table>
+<p>四条铁律（违反任意一条都会重现上一版的缺陷）：</p>
+<ul>
+<li><b>规则只准省钱，不准判价值。</b>规则可以决定"跳过模型"，但只能跳过闭集内的确定对象（例如与工作记忆完全相同的重复轮次），不能用长度、字数、标点这类代理指标。</li>
+<li><b>判价值的只能是 system2。</b>它说没价值，那是"这轮不产生新记忆"，不是"丢弃原文"。</li>
+<li><b>嵌入只负责相似度，不负责结论。</b>相似 ≠ 同一件事，所以合并永远需要 system2 仲裁。</li>
+<li><b>system1 只准决定时机。</b>它回答"现在处理还是稍后处理"，永远不回答"存不存"。</li>
+</ul>
+
+<h2>二、记忆分层与对象</h2>
+<table>
+<thead>
+<tr><th>层级</th><th>作用</th><th>典型内容</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>工作记忆</strong></td><td>当前会话缓冲区，三条线唯一入口</td><td>最近 8 轮原始对话（用户输入、查询、宠物回复）</td></tr>
+<tr><td><strong>情景 episodic</strong></td><td>事件级记录</td><td>某次对话发生了什么、任务状态</td></tr>
+<tr><td><strong>语义 semantic</strong></td><td>事实与偏好</td><td>用户习惯、项目约束、实体关系</td></tr>
+<tr><td><strong>程序 procedural</strong></td><td>能力与流程</td><td>工作流、工具策略、可复用步骤</td></tr>
+<tr><td><strong>身份 identity</strong></td><td>稳定自我模型</td><td>长期目标、风险偏好、安全边界</td></tr>
+</tbody></table>
+<pre><code class="language-python">class Memory:
+    id: str
+    layer: str                # &quot;episodic&quot; | &quot;semantic&quot; | &quot;procedural&quot; | &quot;identity&quot;
+    content: str
+    importance: float         # 0~1，写入时由规则确定，只影响排序与复习节奏
+    strength: float           # 0~1，复习上升、按「经历轮次」衰减（不是按日历天）
+    review_count: int
+    created_tick: int         # 创建时的逻辑时钟
+    last_review_tick: int     # 上次被召回/复习时的逻辑时钟
+    next_review_tick: int     # 下次该结算的 tick（反思线据此挑目标）
+    decayed_tick: int         # 上次结算衰减用的 tick：保证同一段时间不会被重复扣
+    created_at: datetime      # 宿主传进来的展示时间戳（Event.at），本库从不读墙钟
+    source_event_id: str
+    tags: list[str]
+    status: str               # &quot;active&quot;（清晰）| &quot;fading&quot;（细节变淡）| &quot;archived&quot;（压成索引，仍可召回）
+
+    # 以下为本版新增，保证"判断可追溯、历史可回滚"
+    embedding: bytes          # float32[1024] 打包，embedding 模型不可用时为 NULL
+    embedding_model: str      # 例如 &quot;qwen3-embedding:0.6b&quot;，换模型后据此重算
+    supersedes: str | None    # 被本条取代的旧记忆 id（矛盾/更新时产生，旧记录转 archived，原文保留）
+    confidence: float         # system2 自评，用于排查模型抖动，不参与丢弃
+    due_at: str | None        # 提醒：内容里说的那一刻（YYYY-MM-DD HH:MM，本地时间），不是生命周期
+    notified: bool            # 提醒是否已交付给宿主，避免同一个提醒反复响
+</code></pre>
+<p><code>content</code> 一经写入<b>永不被覆写</b>。更新只能产生新记录并带上 <code>supersedes</code>，旧记录转 archived——这条规则让"记忆被改写成别的意思"从可能变成不可能。</p>
+
+<h3>逻辑时钟：遗忘由经历驱动，不看日历</h3>
+<p>强度不是时间（wall clock）的函数，而是<b>经历次数</b>的函数。全局维护一个单调递增的整数 <code>tick</code>，与记忆同库存持久化（<code>meta</code> 表），每有一轮对话进入工作记忆就 +1。记忆只记录自己在第几 tick 出生、第几 tick 被复习，衰减按"经历了多少轮"结算：</p>
+<pre><code class="language-python"># 曲线形状沿用艾宾浩斯：指数衰减 + 强度越结实衰减越慢；自变量从「天」换成「经历轮次」
+def apply_decay(mem: Memory, tick: int) -&gt; None:
+    if mem.status == &quot;archived&quot;:
+        return
+    delta = tick - mem.decayed_tick              # 距上次结算经历了多少轮，不是过了多少天
+    rate = 0.02 / (1 + mem.strength * 2 + mem.importance * 3)   # 越结实越难忘
+    decay = 1 - exp(-rate * delta / DECAY_SCALE)                # DECAY_SCALE ≈ 20 轮（需标定）
+    mem.strength = max(0.0, mem.strength - decay * mem.strength)
+    mem.decayed_tick = tick                      # 增量结算：同一 tick 反复算也不会多扣
+
+    if mem.strength &lt; 0.05 and mem.review_count == 0:
+        mem.status = &quot;archived&quot;
+    elif mem.strength &lt; 0.08:
+        mem.status = &quot;fading&quot;
+
+def freshness(mem: Memory, tick: int) -&gt; float:
+    &quot;&quot;&quot;新鲜度同样只看经历轮次，不看日期。&quot;&quot;&quot;
+    return exp(-(tick - mem.last_review_tick) / FRESH_SCALE)      # FRESH_SCALE ≈ 8 轮（需标定）
+</code></pre>
+<p>换掉墙钟带来四个直接后果，都是想要的：</p>
+<ul>
+<li><b>关机不遗忘。</b>宠物关掉一个月再打开，tick 一步没动，所有记忆强度原样——对它来说这一个月什么都没发生。</li>
+<li><b>时钟不再可信也不影响正确性。</b>改系统时间、跨时区、夏令时、机器休眠、笔记本合盖，全部与记忆机制无关，因为没有任何计算读墙钟。</li>
+<li><b>可复现。</b>同一条对话序列永远得到同一个记忆状态；测试只要把 tick 推到第 N 轮，不需要注入时钟。</li>
+<li><b>结算次数无关。</b>衰减按「距上次结算」增量结算并记录 <code>decayed_tick</code>，所以每轮结算一次和攒 100 轮结算一次结果相同。早期版本用 <code>tick - last_review_tick</code> 且不回写，同一段时间被反复扣——实测 116 轮就归档，修好后是 6594 轮。<b>"用得越勤忘得越快"这种反直觉行为就是这么来的。</b></li>
+</ul>
+<h3>遗忘是压缩，不是消失</h3>
+<p>这里的宠物不是人脑：存储够用，就不该真的缺东西。衰减只做三件事：<b>降低清晰度</b>（active → fading → archived 三个档位就是压缩程度）、<b>降低召回排序权重</b>（压缩态打 0.5 折）、<b>压低细节的可读性</b>。它<b>不</b>做的是：把记忆从库里抹掉、或者让它不可召回。</p>
+<ul>
+<li>强度有地板（<code>STRENGTH_FLOOR = 0.03</code>）：压到底也保留最小可召回权重，永远不会归零。</li>
+<li>召回范围是<b>全部记忆</b>，归档记录照常参与打分，只是排在清晰记忆之后。</li>
+<li>被想起就重新变清晰（<code>update_strength_on_recall</code> 会把 status 拉回 active）——这就是"旧事重提，细节又回来了"。</li>
+<li>所以长期闲置的代价是"想起来要多问一句"，不是"想不起来"。</li>
+</ul>
+<p>库里不存任何墙钟时间（<code>created_at</code> 已删除）：宿主若要显示"三天前说过"，按记忆 ID 自己记时间。</p>
+
+<h3>时间事实：提醒</h3>
+<p>"2026-11-15 提醒我买蛋糕"里的 11-15 不是记忆的年龄，而是<b>事实本身</b>，所以它存在内容侧（<code>due_at</code>），与生命周期（tick）完全分开：</p>
+<ul>
+<li><b>换算由代码做，不交给模型。</b>实测 0.8b 会把示例里的日期照抄、把「下周三」算成明天。确定性解析（<code>memory/dateparse.go</code>）覆盖：<code>YYYY-MM-DD</code>、今天/明天/明天晚上/后天/大后天、<code>N 天后</code>、<code>N 周后</code>、<code>N 个月后</code>、<code>下下周三</code>、<code>下周X / 这周X / 周X</code>、<code>下个月 N 号</code>、<code>月底</code>、<code>M月D日</code>（今年已过则明年），中文数字（两/十五/三十五）同样支持。</li>
+<li><b>到期时间精确到分钟：</b><code>due_at</code> 是 <code>YYYY-MM-DD HH:MM</code>（本地时间）。时刻支持 <code>15:30</code>、<code>下午3点</code>、<code>下午3点半</code>、<code>晚上8点</code>、<code>凌晨2点</code>、<code>中午12点</code>；只说日期不说时刻时默认 <b>09:00</b>；只说"几点"不提日期时，取<b>最近一次到来的那个时刻</b>（今天已过则明天）。</li>
+<li><b>三级兜底，保证不丢也不猜：</b>①代码解析 → ②模型给的绝对日期（校验格式 + 必须落在今天～5 年内）→ ③都失败则标 <code>pending_due</code>，由宿主回问「哪天？」，用户补上后 <code>ConfirmDue</code> 落库。<b>绝不写一个猜出来的日期。</b></li>
+<li><b>库不读墙钟，提醒由宿主触发。</b><code>DueReminders(now)</code> 返回该响的提醒并标记 <code>notified</code>；同一提醒只响一次。递送方式（气泡、通知）是宿主的事。</li>
+<li><b>提醒不参与衰减压缩。</b>到期前、以及日期还没补齐时，都不该因为"几周没人提"就沉下去。</li>
+<li><b>过期处理（方案 c）：</b>过了 <code>due_at</code> 且已经交付过的提醒，反思时归档——原文保留、仍可召回；<b>没交付过的过期提醒不归档</b>，否则宿主关机期间就是静默丢失。</li>
+<li>相对时间必须有锚点：<code>Event.At</code> 由宿主传入，只用于把"明天/下周三"换算成绝对日期；它不是记忆的时间戳。</li>
+</ul>
+
+<h2>三、唯一 system2 调用点：逐轮抽取</h2>
+<p>只用一次模型调用回答三件事：值不值得记、属于哪层、怎么表述。它<b>不做</b>合并、不做打分、不做丢弃决定。</p>
+<pre><code class="language-python">SCHEMA = {
+  &quot;type&quot;: &quot;object&quot;,
+  &quot;properties&quot;: {
+    &quot;worth&quot;:      {&quot;type&quot;: &quot;boolean&quot;},                    # 本轮是否产生新记忆
+    &quot;layer&quot;:      {&quot;enum&quot;: [&quot;episodic&quot;, &quot;semantic&quot;, &quot;procedural&quot;, &quot;identity&quot;]},
+    &quot;summary&quot;:    {&quot;type&quot;: &quot;string&quot;},                     # 一句话，主语用「用户」
+    &quot;tags&quot;:       {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    &quot;entities&quot;:   {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    &quot;confidence&quot;: {&quot;type&quot;: &quot;number&quot;},                     # 0~1 自评
+  },
+  &quot;required&quot;: [&quot;worth&quot;, &quot;layer&quot;, &quot;summary&quot;, &quot;tags&quot;, &quot;entities&quot;, &quot;confidence&quot;],
+}
+
+def encode_with_small_model(turn: str) -&gt; tuple[dict | None, Exception | None]:
+    &quot;&quot;&quot;逐轮调用，只看本轮原文。
+
+    请求参数（三个都是必须的，缺一个就会静默退化）：
+      think  = false         # qwen3.5 默认开思维链，会烧光 num_predict 只产出 thinking
+      format = SCHEMA        # 结构化输出，字段与类型由语法强制，不靠叮嘱
+      options = {temperature: 0, num_predict: 256}
+    prompt 里必须有一个 few-shot 示例：0.8b 对纯规则式 prompt 会输出空 summary。
+    &quot;&quot;&quot;
+
+def encode_memory(turn: str) -&gt; list[Memory]:
+    extracted, err = encode_with_small_model(turn)
+    if err is not None:
+        # 模型不可用就不产生长期记忆——像发烧时记不住事。原文仍留在工作记忆里（几轮后被挤出），
+        # 但它不会变成可召回的记忆；怎么提示用户由宿主应用决定。
+        raise err
+
+    # 模型判定本轮没有新的长期信息：不产生记忆，工作记忆里原文仍在。
+    if not extracted[&quot;worth&quot;]:
+        return []
+
+    mem = Memory(
+        layer=extracted[&quot;layer&quot;],
+        content=extracted[&quot;summary&quot;],
+        importance=score_importance(turn, extracted),
+        strength=0.3,
+        review_count=0,
+        created_tick=clock.tick,
+        last_review_tick=clock.tick,
+        next_review_tick=clock.tick + REVIEW_INTERVALS[0],   # 8 档，单位是轮次
+        created_at=event.at,                                 # 宿主提供的展示时间戳
+        source_event_id=event_id,
+        tags=extracted[&quot;tags&quot;],
+        status=&quot;active&quot;,
+        embedding=embed(extracted[&quot;summary&quot;]),
+        confidence=extracted[&quot;confidence&quot;],
+    )
+    resolve_relation(mem)      # 第五节：embedding 粗筛 → system2 仲裁
+    store.save(mem)
+    return [mem]
+</code></pre>
+<p>编码线<b>只吃本轮原文</b>，不喂上下文。早期版本把整段工作记忆喂进去，0.8b 分不清本轮与上文，每轮都把上文重新摘要一遍，同一件事存出四条变体；指代消解交给召回线（它本来就拿整段工作记忆找线索），编码线不需要上下文。</p>
+
+<h2>四、失败与遗忘：模型不可用就不产生长期记忆</h2>
+<pre class="mermaid">flowchart TD
+    T[&quot;本轮原文&quot;] --&gt; M{&quot;system2 可用？&quot;}
+    M --&gt;|&quot;否&quot;| NOMEM[&quot;不产生长期记忆&lt;br/&gt;原文只留在工作记忆&lt;br/&gt;错误交回宿主应用&quot;]
+    M --&gt;|&quot;是&quot;| W{&quot;worth？&quot;}
+    W --&gt;|&quot;否（本轮无新信息）&quot;| SKIP[&quot;不产生记忆&lt;br/&gt;原文仍在工作记忆&quot;]
+    W --&gt;|&quot;是&quot;| NEW[&quot;按 schema 落库（active, strength=0.3）&quot;]
+    NEW --&gt; FORGET[&quot;唯一的遗忘出口：衰减 → fading → archived&lt;br/&gt;归档记录不删除，可追溯&quot;]
+</pre>
+<table>
+<thead>
+<tr><th>情形</th><th>返回值</th><th>落库</th><th>用户可见后果</th></tr>
+</thead>
+<tbody>
+<tr><td>模型判定无新信息</td><td><code>(nil, nil)</code></td><td>不产生长期记忆</td><td>无（原文仍在工作记忆，几轮后挤出）</td></tr>
+<tr><td>模型不可用 / 超时 / 解析失败</td><td><code>(nil, err)</code></td><td><b>不产生长期记忆</b></td><td>这一轮没记住，由宿主应用决定是否提示；原文只留在工作记忆里，不会变成可召回的记忆</td></tr>
+<tr><td>embedding 不可用</td><td>—</td><td>记忆照写，<code>embedding=NULL</code></td><td>召回退化为强度/标签排序，<b>不假造相似度</b></td></tr>
+<tr><td>重要性低</td><td>—</td><td><b>照写</b>，importance 低即可</td><td>更早被压成索引（仍可召回），不需要专门丢</td></tr>
+</tbody></table>
+<p>把"连不上模型"的处理放在库里是错误的：那是宿主应用的事（CLI 选择报错退出，桌面宠物可以选择气泡提示"我有点晕，刚才那句没记住"）。库只负责一件事——<b>没有可靠的语义判断，就不产生记忆</b>，像发烧的人记不住事。这样也避免了"模型时好时坏导致同一句话有时存有时不存"这种无法验收的行为。</p>
+<p><b>为什么取消"importance &lt; 0.25 就丢"：</b>同一个句子存不存，取决于模型调用是否超时——模型坏了反而存得更多。这种"结局依赖可用性"的行为无法验收。取消之后，丢弃统一由衰减完成：低价值的记忆自然沉底，需要的记忆被复习留下，<b>遗忘变成一种可观测的时间函数，而不是一个隐式的 if</b>。</p>
+
+<h2>五、冲突与更新： embedding 粗筛 + system2 仲裁 + supersede 链</h2>
+<pre class="mermaid">flowchart TD
+    N[&quot;新记忆 mem&quot;] --&gt; E{&quot;embedding 粗筛&lt;br/&gt;cos ≥ 0.65，取 top3（不看层级）&quot;}
+    E --&gt;|&quot;无候选&quot;| SAVE[&quot;直接落库&quot;]
+    E --&gt;|&quot;有候选&quot;| C[&quot;system2 四分类：&lt;br/&gt;补充 / 更新 / 矛盾 / 无关&quot;]
+    C --&gt;|&quot;无关&quot;| SAVE
+    C --&gt;|&quot;补充&quot;| LINK[&quot;两条都保留，加 related 标签&quot;]
+    C --&gt;|&quot;更新 / 矛盾&quot;| SUP[&quot;新记录 supersedes=旧 id&lt;br/&gt;旧记录转 archived（原文保留）&quot;]
+    LINK --&gt; SAVE
+    SUP --&gt; SAVE
+</pre>
+<p>上一版用余弦 0.85 直接覆写 <code>old.content</code>，后果是"用户说偏好深色"之后改说"偏好浅色"，旧事实被<b>永久擦掉</b>，而矛盾仲裁无从谈起。本版：</p>
+<ul>
+<li>相似只用来<b>挑候选</b>，不用来下结论；</li>
+<li>是不是同一件事、是更新还是矛盾，由 system2 回答（一次很短的调用，输入只有新旧两条文本）；</li>
+<li>任何"取代"都留下 <code>supersedes</code> 链，旧记录 archived 且原文完整——任何时候都能回答"这条记忆是怎么变成现在这样的"；</li>
+<li><b>粗筛不按层级过滤。</b>层级由小模型判定，同一件事两次可能被判成 semantic / identity，拿它当去重条件会让"改口"直接漏掉（实测踩过：深色→浅色被分成两层，整条替代链没触发）。层级只在反思合簇时才用。</li>
+<li><b>提醒不参与关系仲裁。</b>两条提醒是两件待办，实测 0.8b 会把「提醒我体检」和「提醒我开会」判成 <code>update</code>，于是后者把前者归档——一条提醒被另一条吃掉。所有带 <code>due_at</code> / <code>pending_due</code> 的记忆既不作为候选，也不发起仲裁。</li>
+</ul>
+<p>粗筛阈值 0.65 是实测值（qwen3-embedding:0.6b：相关 0.78~0.90、无关 0.37~0.61），换 embedding 模型后必须重标；拿不准时把粗筛放宽（宁可多问 system2 一次），不要收紧。</p>
+
+<h2>六、重要性评分（纯规则，只加分不丢弃）</h2>
+<pre><code class="language-python">def score_importance(turn: str, extracted: dict) -&gt; float:
+    &quot;&quot;&quot;只回答「先想起谁」，不回答「存不存」。&quot;&quot;&quot;
+    score = 0.0
+    if has_explicit_remember_request(turn):   score += 0.5   # 用户明确说「记住」
+    if extracted[&quot;layer&quot;] == &quot;identity&quot;:      score += 0.3
+    if extracted[&quot;layer&quot;] == &quot;procedural&quot;:    score += 0.2
+    score += 0.1 * min(len(extracted[&quot;entities&quot;]), 3)
+    if is_repeated_pattern(extracted[&quot;summary&quot;]):  score += 0.2  # embedding 命中已有记忆
+    return min(1.0, score)
+</code></pre>
+<p><code>is_repeated_pattern</code> 的实现要求：用<b>新记忆的 embedding 与候选记忆的 embedding</b> 比较，不得在打分阶段对所有记忆重新计算向量（上一版每轮 O(N) 次 embedding，随记忆增长线性变慢）。</p>
+
+<h2>七、召回线</h2>
+<pre><code class="language-python">def retrieve_memories(turns: list[str]) -&gt; list[Memory]:
+    &quot;&quot;&quot;turns 是工作记忆，本轮在最后一条。&quot;&quot;&quot;
+    # 1. 查询表示：逐轮 embed，按轮次加权合成（越近权重越高），不做字符串拼接
+    vectors = [embed(t) for t in turns]
+    weights = [0.5 ** (len(turns) - 1 - i) for i in range(len(turns))]
+    qvec = normalize(sum(w * v for w, v in zip(weights, vectors)))
+
+    # 1b. 门与排序分开：只用本轮最后一句当「现在在问什么」。
+    #     整段上下文混在一起会把无关旧账也顶上来（实测：连续聊过界面后问天气，
+    #     仍会返回界面偏好）。纯追问（「那它呢」「继续」）没有检索内容，跳过这道门。
+    focus = None if is_context_only(turns[-1]) else normalize(embed(turns[-1]))
+
+    # 2. 候选：**全部记忆**都在候选池里，归档不等于消失
+    candidates = dedup(vector_search(qvec, k=50), tag_lookup(turns))
+
+    # 3. 精排：纯规则打分，不需要模型
+    scored = []
+    for mem in candidates:
+        apply_decay(mem, clock.tick)                      # 惰性衰减，按经历轮次结算
+        if focus and normalize_similarity(cosine(mem.embedding, focus)) &lt; MIN_RELEVANCE:
+            continue                                      # 语义上不相关：强度再高也不该被想起
+        relevance = normalize_similarity(cosine(mem.embedding, qvec))
+        score = (relevance * 0.40 + mem.strength * 0.25
+                 + mem.importance * 0.20 + freshness(mem, clock.tick) * 0.15)
+        if mem.layer == &quot;identity&quot;:
+            score = max(score, 0.5 * relevance)           # 身份层保底
+        if mem.status == &quot;archived&quot;:
+            score *= 0.5                                  # 压缩态：仍能想起，只是排在清晰记忆之后
+        scored.append((score, mem))
+
+    # 4. top-N + 被动复习（想起即重新变清晰）
+    results = []
+    for score, mem in sorted(scored, reverse=True)[:MAX_RETURN]:
+        update_strength_on_recall(mem, score)
+        results.append(mem)
+    return results
+</code></pre>
+<pre class="mermaid">flowchart TD
+    Q[&quot;工作记忆：本轮 + 最近几轮&quot;] --&gt; EW[&quot;逐轮 embedding&lt;br/&gt;按 0.5^k 权重合成查询向量&quot;]
+    EW --&gt; CAN[&quot;候选 = 向量近邻 top50 + 标签匹配 → 去重&quot;]
+    CAN --&gt; DEC[&quot;apply_decay（仅对候选，按 tick 结算）&quot;]
+    DEC --&gt; SCOR[&quot;score = relevance×0.40 + strength×0.25&lt;br/&gt;+ importance×0.20 + freshness×0.15&quot;]
+    SCOR --&gt; IDQ{&quot;身份层？&quot;}
+    IDQ --&gt;|&quot;是&quot;| FLOOR[&quot;score ≥ 0.5×relevance 保底&quot;]
+    IDQ --&gt;|&quot;否&quot;| SORT[&quot;排序取 top MAX_RETURN&quot;]
+    FLOOR --&gt; SORT
+    SORT --&gt; RV[&quot;被动复习：强度↑ 计数↑&lt;br/&gt;last_review_tick = 当前 tick&quot;]
+    RV --&gt; OUT[&quot;返回记忆列表，注入本轮回复上下文&quot;]
+</pre>
+<p>逐轮加权而不是拼接，是因为拼接会把"那它还有什么讲究"这类只有指代的轮次稀释掉，而权重衰减保留了"最近说的是什么"。</p>
+<h3>被动复习与复习间隔</h3>
+<pre><code class="language-python">REVIEW_INTERVALS = [1, 2, 5, 12, 30, 70, 150, 300]   # 单位：经历轮次（tick），曲线形状沿用艾宾浩斯
+
+def update_strength_on_recall(mem: Memory, relevance: float) -&gt; None:
+    &quot;&quot;&quot;被召回 = 一次主动复习：间隔越复习越长，强度增益越复习越小。&quot;&quot;&quot;
+    gain = 0.12 / (1 + mem.review_count * 0.3)
+    mem.strength = min(1.0, mem.strength + gain * relevance)
+    mem.review_count += 1
+    mem.last_review_tick = clock.tick
+    mem.next_review_tick = clock.tick + REVIEW_INTERVALS[min(mem.review_count, len(REVIEW_INTERVALS) - 1)]
+    mem.status = &quot;active&quot;
+</code></pre>
+
+<h2>八、反思线（定时任务，允许调用模型）</h2>
+<pre><code class="language-python">def reflect_loop():
+    # 一次反思 = 一次「睡眠整理」：把所有活跃记忆按当前 tick 统一结算一次，
+    # 再做合簇与升级。注意 tick 不因为反思而前进——反思不是经历，只是整理。
+    # 1. 睡眠整理：所有活跃记忆按当前 tick 统一结算衰减
+    for mem in store.active():
+        apply_decay(mem, clock.tick)
+    for mem in store.find_by_status(&quot;fading&quot;):
+        if mem.strength &lt; 0.03:
+            mem.status = &quot;archived&quot;          # 归档，不删除
+
+    # 2. 提醒的到期与过期（日期判断，只在这里发生，且由宿主提供 today）
+    for mem in store.all():
+        if mem.due_at and mem.due_at < today and mem.notified:
+            mem.status = &quot;archived&quot;          # 方案 c：过期就归档，原文保留仍可召回
+        # 没交付过的过期提醒不归档——宿主关机期间不该静默丢失
+
+    # 3. 合簇：默认关闭（合并会改写当前摘要；先回放验证）
+    #    （「用户要买蛋糕」与「用户要交房租」余弦 = 1.000），任何阈值下都会把无关记忆
+    #    合成一条。换中文能力足够的嵌入模型（如 bge-m3）并重标阈值后再打开。
+    if MERGE_ENABLED:
+        for cluster in cluster_by_embedding(store.active(), threshold=MERGE_THRESHOLD):
+            if len(cluster) &lt; 2:
+                continue
+            merged = ask_system2_to_merge(cluster)   # &quot;这些是不是同一件事？合并后怎么表述？&quot;
+            if merged:
+                store.save(new_memory(merged, supersedes=[m.id for m in cluster]))
+                for m in cluster:
+                    m.status = &quot;archived&quot;            # 原文保留，链路可追溯
+
+    # 4. 身份提炼：标签/簇出现 ≥ 3 次 → 问 system2 &quot;这些是否构成稳定的用户画像？&quot;
+    for pattern in find_recurring_patterns(store.semantic_memories(), min_count=3):
+        if not has_identity_covering(pattern):
+            store.save(promote_to_identity(pattern))   # system2 输出规范表述
+</code></pre>
+<p>上一版用"同一 tag 出现 3 次"直接升级身份层，而 tag 由 0.8b 抖动生成，结果是身份层几乎永不触发、偶尔误触发。本版把"是不是稳定画像"这个语义判断交给 system2，规则只负责<b>筛出值得问的簇</b>（这是 embedding 和计数的正当用途）。</p>
+
+<h2>九、模型、阈值与标定</h2>
+<table>
+<thead>
+<tr><th>用途</th><th>模型</th><th>关键参数</th><th>不可用时的行为</th></tr>
+</thead>
+<tbody>
+<tr><td>编码抽取（system2）</td><td><code>qwen3.5:0.8b</code></td><td>JSON Schema 约束、<code>reasoning_effort=none</code>（关思维链）、temp=0、max_tokens=512</td><td><b>这一轮不产生长期记忆</b>（原文只在工作记忆里），错误交回宿主应用</td></tr>
+<tr><td>冲突仲裁 / 合簇表述 / 身份提炼</td><td>同上</td><td>输入只有两三条候选，输出短</td><td>跳过本次合并，保留原状</td></tr>
+<tr><td>语义相似度</td><td><code>qwen3-embedding:0.6b</code>，1024 维（<code>nomic-embed-text</code> 中文区分度不足，已弃用，见第九节）</td><td>L2 归一化，余弦</td><td>召回退化为标签/强度排序，不假造相似度</td></tr>
+<tr><td>编码时机路由（可选 system1）</td><td><code>qwen3:0.6b</code></td><td>二分类，约 150ms</td><td>默认进异步队列</td></tr>
+</tbody></table>
+<h3>阈值必须标定，不能继承</h3>
+<p>下面的数值是<b>起点</b>，不是结论。换 embedding 模型、换语言、换领域都要重标，标定方法是用真实对话样本画一次相似度分布：</p>
+<table>
+<thead>
+<tr><th>阈值</th><th>起点值</th><th>含义</th><th>标定信号</th></tr>
+</thead>
+<tbody>
+<tr><td>冲突粗筛</td><td>0.65</td><td>值得让 system2 判一下关系</td><td>qwen3-embedding:0.6b 实测：「相关」0.78~0.90、「无关」0.37~0.61，取两者之间</td></tr>
+<tr><td>合簇</td><td>0.85（当前<b>关闭</b>）</td><td>反思时视为同一件事</td><td>人工标注 200 对；合并会改写当前摘要，先回放验证再开</td></tr>
+<tr><td>身份证据下限</td><td>3 条</td><td>至少几条独立记忆才算稳定画像</td><td>误升级率</td></tr>
+<tr><td>召回相关度 MIN_RELEVANCE</td><td>0.30（归一化后）</td><td><b>唯一的召回门槛：用本轮最后一句算，语义无关的候选直接剔除</b>——强度/重要性再高也不进入结果，否则无关查询会顶上来并顺带强化它</td><td>qwen3-embedding:0.6b 实测：无关查询 0.15~0.17，相关查询 0.58~0.72</td></tr>
+<tr><td>（已删除）总分下限</td><td>—</td><td>原 MIN_SCORE=0.12：有 MIN_RELEVANCE 之后恒为真（0.40×0.30 已等于 0.12），留着只会让人误以为还有一道保护</td><td>—</td></tr>
+<tr><td>相似度拉伸区间</td><td>[0.35, 0.90]</td><td>真嵌入对任意两句中文都有 ~0.4 的基线，必须线性拉伸成 0~1 才有区分度</td><td>换嵌入模型必须重标这两个端点</td></tr>
+<tr><td>衰减尺度 DECAY_SCALE</td><td>30 轮（待定）</td><td>多少轮经历后细节明显变淡（不消失）</td><td>压到地板所需的轮数：scale=30 → imp0.8 约 12554 轮 / imp0.2 约 6337 轮；20 → 8369 / 4225；5 → 2093 / 1057。只影响"什么时候压成索引"和排序折扣</td></tr>
+<tr><td>新鲜度尺度 FRESH_SCALE</td><td>8 轮</td><td>多少轮后算"不再新鲜"</td><td>召回排序里新鲜度的实际区分度</td></tr>
+<tr><td>复习间隔 REVIEW_INTERVALS</td><td>1,2,5,12,30,70,150,300 轮</td><td>复习次数越多，下次间隔越长</td><td>回放长对话，看常驻记忆的复习频率是否够</td></tr>
+</tbody></table>
+<p class="bad">禁止：用哈希词袋、字符重叠率之类的代理向量去套这些阈值。相似度阈值只有在真嵌入下才有语义，词袋距离和语义无关，套上去等于随机。</p>
+<h3>嵌入模型选择：nomic-embed-text 不适合中文</h3>
+<p><code>nomic-embed-text</code> 实测：<code>用户要买蛋糕</code> vs <code>用户要交房租</code> 余弦 <b>1.000</b>，vs <code>用户要给妈妈打电话</code> 0.987——在中文短句上<b>几乎不区分内容</b>，任何阈值都会把无关记忆判成同一件事。已换成 <code>qwen3-embedding:0.6b</code>（1024 维）：同一批短句，无关 0.37~0.61、相关 0.78~0.90，区分度正常。换模型后所有阈值（0.65 / 0.85 / 0.30 / [0.35,0.90]）都按新分布重标过。</p>
+
+<h2>十、延迟与并发</h2>
+<pre class="mermaid">flowchart LR
+    IN[&quot;用户一轮输入&quot;] --&gt; WM[&quot;写入工作记忆（快照本轮）&quot;]
+    WM --&gt; RT[&quot;召回（embedding + 规则排序，&lt; 50ms）&quot;]
+    RT --&gt; REPLY[&quot;生成回复&quot;]
+    WM --&gt; Q[&quot;编码队列&quot;]
+    Q --&gt; ENC[&quot;异步编码：system2 抽取 + embedding + 冲突仲裁&quot;]
+    ENC --&gt; DB[&quot;落库&quot;]
+    RF[&quot;定时反思（每日/启动后闲时）&quot;] --&gt; DB
+</pre>
+<ul>
+<li><b>编码永远不在回复路径上。</b>这是取消"长度预过滤"的前提：不为了 0.5 秒延迟而丢数据，而是把 0.5 秒移到用户读回复的那几秒里。</li>
+<li>队列必须携带<b>本轮原文与当时的工作记忆快照</b>，不能用"处理时的当前工作记忆"——否则异步化会让上下文错位。</li>
+
+<li>反思任务串行化（单实例），避免两个 worker 同时对同一簇做合并。</li>
+<li><b>tick 在写入工作记忆时 +1，同步完成</b>；编码失败、重试、延迟处理都不影响它。这样"经历了多少轮"与"处理了几次"解耦，重试也不会让记忆凭空老化。</li>
+<li>启动时 tick 从 <code>meta</code> 表恢复；库文件缺失即从 0 开始，不做任何基于墙钟的补偿。</li>
+</ul>
+
+<h2>十一、可验收的不变式</h2>
+<p>这一节是给测试用的。每一条都能写成断言，破坏其中任意一条即视为架构回退：</p>
+<table>
+<thead>
+<tr><th>#</th><th>不变式</th><th>怎么测</th></tr>
+</thead>
+<tbody>
+<tr><td>I1</td><td>规则不得基于长度/字数/标点做丢弃</td><td>把 5 字的真偏好喂进编码线，必须产生记忆</td></tr>
+<tr><td>I2</td><td><b>skip 与 error 必须可区分</b>：skip 是正常结论（本轮无新信息），error 是模型不可用——两者都<b>不产生长期记忆</b>，但 error 必须抛错给宿主</td><td>stub 模型分别返回 <code>(nil, nil)</code> 与 <code>(nil, err)</code>，断言两者都不落库且返回值不同</td></tr>
+<tr><td>I3</td><td>已写入的 content 不被覆写</td><td>构造"深色偏好 → 浅色偏好"，断言旧记录仍是深色且 status=archived、新记录 supersedes 指向它</td></tr>
+<tr><td>I4</td><td>模型不可用就不产生长期记忆，且与 skip 可区分</td><td>关掉本地模型跑一轮 <code>add</code>，断言返回错误且库里一条都没多（原文只在工作记忆里）；与 <code>worth=false</code> 的 <code>(nil, nil)</code> 分开测</td></tr>
+<tr><td>I5</td><td>阈值不依赖未标定的向量</td><td>代码里凡是用相似度的地方，embedder 必须是真嵌入实现</td></tr>
+<tr><td>I6</td><td>编码不出现在回复路径上</td><td>注入一个 sleep 5s 的 stub 模型，断言首字延迟不受影响</td></tr>
+<tr><td>I7</td><td>召回结果不写回工作记忆</td><td>连续两轮 ask，第二轮的工作记忆里不得出现第一轮的召回内容</td></tr>
+<tr><td>I8</td><td><b>停机不遗忘</b>：没有新经历就没有衰减</td><td>写入一条记忆后序列化整库，一个月后（墙钟前进、tick 不变）载入，断言 strength/status 完全一致</td></tr>
+<tr><td>I9</td><td><b>与墙钟无关</b>：库内不得出现 <code>time.Now()</code>，时间戳只能由宿主传入</td><td>把 tick 推到第 N 轮，断言结果与真实当前时间无关；<code>grep time.Now memory/</code> 必须为空（测试除外）</td></tr>
+</tbody></table>
+
+<h2>十二、调用总结</h2>
+<table>
+<thead>
+<tr><th>环节</th><th>执行者</th><th>为什么是它</th></tr>
+</thead>
+<tbody>
+<tr><td>值不值得记 / 属哪层 / 摘要</td><td><b>system2</b></td><td>只有语言模型能判断语义价值</td></tr>
+<tr><td>新旧关系（补充/更新/矛盾/无关）</td><td><b>embedding 粗筛 + system2 仲裁</b></td><td>粗筛便宜且可量化，结论必须由语义模型下</td></tr>
+<tr><td>相似度 / 召回 / 聚类</td><td><b>embedding</b></td><td>换词不同义，词袋做不到</td></tr>
+<tr><td>重要性</td><td>规则</td><td>可解释、可复现、只影响排序</td></tr>
+<tr><td>衰减 / 复习间隔 / 状态流转</td><td>数学</td><td>确定性函数，遗忘可观测</td></tr>
+<tr><td>回想与否的路由（可选）</td><td>system1</td><td>只决定时机，不决定内容</td></tr>
+<tr><td>合簇表述 / 身份提炼</td><td><b>system2</b></td><td>"稳定画像"是语义判断，计数做不到</td></tr>
+<tr><td>丢弃</td><td><b>无人</b></td><td>遗忘只由衰减完成，归档永久保留</td></tr>
+<tr><td>模型不可用</td><td><b>不产生长期记忆</b></td><td>没有可靠的语义判断就不记（像发烧失忆）；原文只在工作记忆里滚动，8 轮之后就被挤出；怎么提示用户是宿主应用的事</td></tr>
+</tbody></table>
+<p>一句话概括本版：<b>凡是需要语义的地方都交给模型，凡是需要确定性的地方都交给规则与数学，凡是"省钱"的考虑一律退到异步队列里，绝不进入判断链。</b></p>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/pele@1/dist/pele.global.js"></script>
+<script>
+  // mount：按卡片宽度自适应缩放（不留滚动条，窗口变宽自动重排），缩小时提供缩放按钮
+  for (const el of document.querySelectorAll('pre.mermaid')) {
+    const source = el.textContent;
+    try {
+      pele.mount(el, source, { zoom: 'auto' });
+    } catch (error) {
+      el.textContent = source + '\n\n[渲染失败] ' + error.message;
+    }
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# 构建产物
+*.exe
+*.dll
+*.so
+*.dylib
+pet-memory
+
+# 本地数据（SQLite + WAL）
+*.db
+*.db-wal
+*.db-shm
+*.json.imported
+
+# 测试/调试产物
+.playwright-mcp/
+tmp_lifecycle/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
